@@ -166,7 +166,7 @@ def loadsysts(fname, ttree_df, c):
 
     return event_weights_pertree
 
-def process_branch(c, branch, evws, mcpot, subchannel_index, syst_vector, syst_additional_weight, inprop):
+def process_branch(c, branch, evws, mcpot, subchannel_index, syst_vector, syst_additional_weight, spline_additional_weight_values, inprop):
     # Load values
     total_num_sys = len(syst_vector)
     reco_value = branch.GetValue()
@@ -224,9 +224,34 @@ def process_branch(c, branch, evws, mcpot, subchannel_index, syst_vector, syst_a
             else:
                 pass # TODO -- implement other binning
 
-            s.FillCV(spline_bin[valid], mc_weight[valid])
-            for i_univ, shift in enumerate(s.knobval):
-                s.FillUniverse(i_univ, spline_bin[valid], (mc_weight*additional_weight*evw.shift(shift))[valid])
+            # Determine the additional weight for spline universes
+            # If spline_additional_weight is set, use that instead of additional_weight
+            sys_name = s.GetSysName()
+            if sys_name in spline_additional_weight_values:
+                spline_add_weight = spline_additional_weight_values[sys_name]
+                if not isinstance(spline_add_weight, pd.Series):
+                    spline_add_weight = pd.Series(spline_add_weight, true_param.index)
+            else:
+                spline_add_weight = additional_weight
+
+            # Check if 0 is in knobvals
+            has_zero_knob = 0 in s.knobval
+
+            # Fill CV: use additional_weight if there's no 0 knob, otherwise just mc_weight
+            if has_zero_knob:
+                s.FillCV(spline_bin[valid], mc_weight[valid])
+            else:
+                s.FillCV(spline_bin[valid], (mc_weight*additional_weight)[valid])
+            
+            # If force_0_cv is set, normalize shifts by the shift at knob=0
+            # Note: This is also implemented in PROsyst::FillSpline for the C++ code path
+            if s.force_0_cv:
+                cv_shift = evw.shift(0)
+                for i_univ, shift in enumerate(s.knobval):
+                    s.FillUniverse(i_univ, spline_bin[valid], (mc_weight*spline_add_weight*evw.shift(shift)/cv_shift)[valid])
+            else:
+                for i_univ, shift in enumerate(s.knobval):
+                    s.FillUniverse(i_univ, spline_bin[valid], (mc_weight*spline_add_weight*evw.shift(shift))[valid])
         else:
             s.FillCV(global_bin[valid], mc_weight[valid])
             for i_univ in range(s.GetNUniverse()):
@@ -240,6 +265,14 @@ def process_events(df, fid, syst_structs, evw, prop, c):
         if s.HasWeightFormula():
             sys_weight_formula.append(profit.DataFrameFormula("weightMapsFormulas_%i_%s" % (fid, s.GetSysName()), s.GetWeightFormula(), df))
 
+    # Create formulas for spline_additional_weight if specified
+    spline_additional_weight_formulas = {}
+    for s in syst_structs:
+        if s.spline_additional_weight:
+            spline_additional_weight_formulas[s.GetSysName()] = profit.DataFrameFormula(
+                "splineAdditionalWeight_%i_%s" % (fid, s.GetSysName()), 
+                s.spline_additional_weight, df)
+
     branches = c.m_branch_variables[fid]
     subchannel_index = []
     for ib, b in enumerate(branches):
@@ -251,9 +284,14 @@ def process_events(df, fid, syst_structs, evw, prop, c):
     for s in sys_weight_formula:
         sys_weight_values.append(s.EvalInstance())
 
+    # Calculate spline additional weights
+    spline_additional_weight_values = {}
+    for name, formula in spline_additional_weight_formulas.items():
+        spline_additional_weight_values[name] = formula.EvalInstance()
+
     # calculate stuff on each event
     for ib, b in enumerate(branches):
-        process_branch(c, b, evw, c.m_mcgen_pot[fid], subchannel_index[ib], syst_structs, sys_weight_values, prop)
+        process_branch(c, b, evw, c.m_mcgen_pot[fid], subchannel_index[ib], syst_structs, sys_weight_values, spline_additional_weight_values, prop)
 
     # Done!
     return

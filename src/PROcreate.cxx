@@ -423,6 +423,16 @@ namespace PROfit {
                     sv.back().knobval = sv.back().knob_index;
                     std::sort(sv.back().knobval.begin(), sv.back().knobval.end());
                     sv.back().binning = binningindex;
+                    // Check if force_0_cv is set for this systematic
+                    if(inconfig.m_mcgen_variation_force_0_cv.find(sys_name) != inconfig.m_mcgen_variation_force_0_cv.end()) {
+                        sv.back().force_0_cv = inconfig.m_mcgen_variation_force_0_cv.at(sys_name);
+                        log<LOG_INFO>(L"%1% || Setting force_0_cv=true for systematic %2%") % __func__ % sys_name.c_str();
+                    }
+                    // Check if spline_additional_weight is set for this systematic
+                    if(inconfig.m_mcgen_variation_spline_additional_weight.find(sys_name) != inconfig.m_mcgen_variation_spline_additional_weight.end()) {
+                        sv.back().spline_additional_weight = inconfig.m_mcgen_variation_spline_additional_weight.at(sys_name);
+                        log<LOG_INFO>(L"%1% || Setting spline_additional_weight='%2%' for systematic %3%") % __func__ % sv.back().spline_additional_weight.c_str() % sys_name.c_str();
+                    }
                 }
                 if(sys_mode == "flat"){
                     log<LOG_INFO>(L"%1% || Systematic variation %2% is a match for a flat covariance systematic. Processing a such. ") % __func__ % sys_name.c_str();
@@ -571,6 +581,22 @@ namespace PROfit {
             }
             log<LOG_DEBUG>(L"%1% || Finished setting up systematic weight formula") % __func__;
 
+            // set up spline_additional_weight formulas
+            std::map<std::string, float> spline_additional_weight_value;
+            std::map<std::string, std::unique_ptr<TTreeFormula>> spline_additional_weight_formula;
+            for(const auto& sv : syst_vector){
+                for(const auto &s: sv) {
+                    if(!s.spline_additional_weight.empty() && spline_additional_weight_formula.find(s.GetSysName()) == spline_additional_weight_formula.end()) {
+                        spline_additional_weight_formula[s.GetSysName()] = std::make_unique<TTreeFormula>(
+                            ("splineAdditionalWeight_"+std::to_string(fid)+"_"+ s.GetSysName()).c_str(), 
+                            s.spline_additional_weight.c_str(), chains[fid]);
+                        spline_additional_weight_value[s.GetSysName()] = 1.0;
+                        log<LOG_INFO>(L"%1% || Created spline_additional_weight formula for %2%: %3%") % __func__ % s.GetSysName().c_str() % s.spline_additional_weight.c_str();
+                    }
+                }
+            }
+            log<LOG_DEBUG>(L"%1% || Finished setting up spline_additional_weight formulas") % __func__;
+
 
             // grab the subchannel index
             int num_branch = inconfig.m_branch_variables[fid].size();
@@ -628,6 +654,11 @@ namespace PROfit {
                             sys_weight_formula[is]->GetNdata();	
                         }
                     }//end sys
+                    // Refresh spline_additional_weight formulas
+                    for(auto& [name, formula] : spline_additional_weight_formula) {
+                        formula->UpdateFormulaLeaves();
+                        formula->GetNdata();
+                    }
                     TObjArray* tbranches = chains[fid]->GetListOfBranches();
                     for (int i = 0; i < tbranches->GetEntries(); i++) {
                         TBranch* branch = (TBranch*)tbranches->At(i);
@@ -644,9 +675,14 @@ namespace PROfit {
                     }
                 }
 
+                // evaluate spline_additional_weight formulas
+                for(auto& [name, formula] : spline_additional_weight_formula) {
+                    spline_additional_weight_value[name] = formula->EvalInstance();
+                }
+
                 //branch loop
                 for(int ib = 0; ib != num_branch; ++ib) {
-                    process_cafana_event(inconfig, branches[ib], f_event_weights[fid][0], inconfig.m_mcgen_pot[fid], subchannel_index[ib], syst_vector, sys_weight_value, inprop);
+                    process_cafana_event(inconfig, branches[ib], f_event_weights[fid][0], inconfig.m_mcgen_pot[fid], subchannel_index[ib], syst_vector, sys_weight_value, spline_additional_weight_value, inprop);
                 } 
 
             } //end of entry loop
@@ -848,7 +884,7 @@ namespace PROfit {
     }
 
 
-    void process_cafana_event(const PROconfig &inconfig, const std::shared_ptr<BranchVariable>& branch, const std::map<std::string, std::vector<eweight_type>*>& eventweight_map, float mcpot, int subchannel_index, std::vector<std::vector<SystStruct>> &syst_vector, const std::vector<float>& syst_additional_weight, PROpeller& inprop){
+    void process_cafana_event(const PROconfig &inconfig, const std::shared_ptr<BranchVariable>& branch, const std::map<std::string, std::vector<eweight_type>*>& eventweight_map, float mcpot, int subchannel_index, std::vector<std::vector<SystStruct>> &syst_vector, const std::vector<float>& syst_additional_weight, const std::map<std::string, float>& spline_additional_weight_value, PROpeller& inprop){
 
 
 
@@ -908,8 +944,27 @@ namespace PROfit {
 
             if(var_syst_objs.front()->mode == "spline") {
                 if(spline_bin < 0) continue;
+
+                // Determine the additional weight for spline universes
+                // If spline_additional_weight is set, use that instead of additional_weight
+                const std::string& sys_name = var_syst_objs.front()->GetSysName();
+                float spline_add_weight = additional_weight;
+                auto spline_weight_iter = spline_additional_weight_value.find(sys_name);
+                if(spline_weight_iter != spline_additional_weight_value.end()) {
+                    spline_add_weight = spline_weight_iter->second;
+                }
+
+                // Check if 0 is in knobvals
+                bool has_zero_knob = false;
+                for(const auto& k : var_syst_objs.front()->knobval) {
+                    if(k == 0) { has_zero_knob = true; break; }
+                }
+
+                // Fill CV: If the zero knob is included, use spline_add_weight like the other variations.
+                // Otherwise, use additional_weight.
+                float cv_weight = has_zero_knob ? mc_weight * spline_add_weight : mc_weight * additional_weight;
                 for(auto so: var_syst_objs)
-                    so->FillCV(spline_bin, mc_weight);
+                    so->FillCV(spline_bin, cv_weight);
 
                 for(int is = 0; is < var_syst_objs.front()->GetNUniverse(); ++is){
                     size_t u = 0;
@@ -919,7 +974,7 @@ namespace PROfit {
                     float w = static_cast<float>(map_iter->second->at(is));
                     if(std::isnan(w) || std::isinf(w)) w = 1;
                     for(auto so: var_syst_objs)
-                        so->FillUniverse(u, spline_bin, mc_weight * additional_weight * w);
+                        so->FillUniverse(u, spline_bin, mc_weight * spline_add_weight * w);
                 }
 
                 continue;

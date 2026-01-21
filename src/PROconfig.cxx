@@ -838,7 +838,7 @@ int PROconfig::LoadFromXML(const std::string &filename){
                 if(text) wt = std::string(text);
 
                 //check for known attributes
-                const std::vector<std::string> expected_attrs = {"type", "plotname", "binning", "knobvals", "tag", "prior", "center"};
+                const std::vector<std::string> expected_attrs = {"type", "plotname", "binning", "knobvals", "tag", "prior", "center", "force_0_cv", "spline_additional_weight"};
                 for (const tinyxml2::XMLAttribute* attr = pAllowList->FirstAttribute(); attr; attr = attr->Next()) {
                     std::string name = attr->Name();
                     if (std::find(expected_attrs.begin(), expected_attrs.end(), name) == expected_attrs.end()) {
@@ -855,6 +855,8 @@ int PROconfig::LoadFromXML(const std::string &filename){
                 const char *tags = pAllowList->Attribute("tag");
                 const char *prior = pAllowList->Attribute("prior");
                 const char *center = pAllowList->Attribute("center");
+                const char *force_0_cv = pAllowList->Attribute("force_0_cv");
+                const char *spline_additional_weight = pAllowList->Attribute("spline_additional_weight");
 
 
 
@@ -914,6 +916,14 @@ int PROconfig::LoadFromXML(const std::string &filename){
                     }
                     if(begin) tags_vec.push_back(std::string(begin, c));
                     m_mcgen_variation_tags[wt] = tags_vec;
+                }
+                if(force_0_cv && strcmp(force_0_cv, "true") == 0) {
+                    m_mcgen_variation_force_0_cv[wt] = true;
+                    log<LOG_INFO>(L"%1% || Parsed force_0_cv=true for systematic %2%") % __func__ % wt.c_str();
+                }
+                if(spline_additional_weight) {
+                    m_mcgen_variation_spline_additional_weight[wt] = std::string(spline_additional_weight);
+                    log<LOG_INFO>(L"%1% || Parsed spline_additional_weight='%2%' for systematic %3%") % __func__ % spline_additional_weight % wt.c_str();
                 }
                 log<LOG_DEBUG>(L"%1% || Allowlisting variations: %2%") % __func__ % wt.c_str() ;
                 pAllowList = pAllowList->NextSiblingElement("allowlist");
@@ -1815,7 +1825,6 @@ ROOTFormula::ROOTFormula(const std::string &name, const std::string &formula, TT
     std::string this_formula;
     while(std::getline(formula_reader, this_formula, ';')) {
         auto f = std::make_unique<TTreeFormula>(name.c_str(), this_formula.c_str(), t);
-        // Check if formula compiled successfully
         if (f->GetNdim() == 0 && f->GetNcodes() == 0) {
             log<LOG_ERROR>(L"%1% || ERROR: TTreeFormula not compiled correctly for formula: %2%") % __func__ % this_formula.c_str();
             exit(EXIT_FAILURE);

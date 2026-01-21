@@ -409,7 +409,9 @@ PYBIND11_MODULE(_profit, m) {
         .def_readwrite("binning", &PROfit::SystStruct::binning)
         .def_readwrite("p_cv", &PROfit::SystStruct::p_cv)
         .def_readwrite("p_multi_spec", &PROfit::SystStruct::p_multi_spec)
-        .def_readonly("index",  &PROfit::SystStruct::index);
+        .def_readonly("index",  &PROfit::SystStruct::index)
+        .def_readwrite("force_0_cv", &PROfit::SystStruct::force_0_cv)
+        .def_readwrite("spline_additional_weight", &PROfit::SystStruct::spline_additional_weight);
 
     // PROsyst
     py::class_<PROfit::PROsyst>(m, "PROsyst")

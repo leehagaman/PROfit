@@ -65,6 +65,8 @@ namespace PROfit{
 
         std::vector<int> norm_bins;
         float norm_value;
+        bool force_0_cv = false; // if true, normalize spline shifts by shift at knob=0
+        std::string spline_additional_weight; // custom additional_weight formula for spline universes (empty = use branch's additional_weight)
 
         //boost serialization
         template<class Archive>
@@ -83,6 +85,8 @@ namespace PROfit{
             ar & hash;
             ar & norm_bins;
             ar & norm_value;
+            ar & force_0_cv;
+            ar & spline_additional_weight;
         }
 
 
@@ -237,7 +241,7 @@ namespace PROfit{
      *		syst_additional_weight: additional weight applied to systematic variation
      */
 
-    void process_cafana_event(const PROconfig &inconfig, const std::shared_ptr<BranchVariable>& branch, const std::map<std::string, std::vector<eweight_type>*>& eventweight_map, float mcpot, int subchannel_index, std::vector<std::vector<SystStruct>> &syst_vector, const std::vector<float>& syst_additional_weight, PROpeller& inprop);
+    void process_cafana_event(const PROconfig &inconfig, const std::shared_ptr<BranchVariable>& branch, const std::map<std::string, std::vector<eweight_type>*>& eventweight_map, float mcpot, int subchannel_index, std::vector<std::vector<SystStruct>> &syst_vector, const std::vector<float>& syst_additional_weight, const std::map<std::string, float>& spline_additional_weight_value, PROpeller& inprop);
 
     std::string convertToXRootD(std::string fname_orig);
 
