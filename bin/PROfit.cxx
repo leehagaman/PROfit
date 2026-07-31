@@ -11,6 +11,7 @@
 #include "PROmetrics/PROpoisson.h"
 #include "PROcess.h"
 #include "PROsurf.h"
+#include "PROnormshape.h"
 #include "PROfc.h"
 #include "PROAdaptiveFC.h"
 #include "PROfitter.h"
@@ -372,6 +373,15 @@ int main(int argc, char* argv[])
     std::vector<float> afc_cleanup_quantiles = {0.025f, 0.975f};
     int afc_cleanup_halo = 1;
 
+    // norm-shape scan
+    std::vector<int> ns_nbins = {20};
+    std::vector<float> ns_lo, ns_hi;
+    int ns_truth_var = 1;
+    std::string ns_channel = "nue";
+    std::string ns_detector = "";
+    float ns_baseline = -1;
+    std::vector<float> ns_spectra;
+
 
     //Global Arguments for all PROfit enables subcommands.
     app.add_option("-x,--xml", xmlname, "Input PROfit XML configuration file.")->required();
@@ -486,6 +496,38 @@ int main(int argc, char* argv[])
     surface_command->add_option("--amr-levels", amr_levels, "AMR refinement depth. Effective resolution along the contour is amr_initial * 2^amr_levels. Default 3.")->default_val(3);
     surface_command->add_option("--amr-delta", amr_delta, "AMR straddle-band widening (chi^2 units). Refines a cell if any corner is within delta of any contour level. Default 0.5.")->default_val(0.5f);
     surface_command->add_option("--amr-levels-chi2", amr_contour_levels, "Vector of Delta-chi^2 target levels for AMR contour finding. Default {5.99} = 95% CL at 2 dof. Pass e.g. --amr-levels-chi2 2.30 5.99 11.83 for 1/2/3 sigma in one pass.");
+
+    //PROnormshape, N-dimensional physics grid scan projected into (shape, norm) space
+    CLI::App *normshape_command = app.add_subcommand("norm-shape",
+        "Scan a cartesian grid over ALL physics parameters; at each point record a chi2 "
+        "(profiled over nuisance splines, or stat-only with --statonly) plus the (norm, shape) "
+        "coordinates of the truth-binned prediction relative to the CV prediction. "
+        "Output <tag>_normshape.txt is binned/profiled into norm-shape exclusion contours downstream.");
+    normshape_command->add_option("--nbins", ns_nbins,
+        "Grid points per physics parameter, in model parameter order. A single value is "
+        "broadcast to all parameters.")->expected(-1);
+    normshape_command->add_option("--lo", ns_lo,
+        "Lower grid limits per physics parameter, LINEAR units, model parameter order. "
+        "Default: model lower bounds (1e-4 where unbounded below in log10).")->expected(-1);
+    normshape_command->add_option("--hi", ns_hi,
+        "Upper grid limits per physics parameter, LINEAR units, model parameter order. "
+        "Default: model upper bounds.")->expected(-1);
+    normshape_command->add_option("--truth-var", ns_truth_var,
+        "Variable index of the truth binning used for norm/shape.")->default_val(1);
+    normshape_command->add_option("--channel", ns_channel,
+        "Channel name whose collapsed truth bins enter norm/shape, concatenated side-by-side "
+        "across all modes and detectors.")->default_str("nue");
+    normshape_command->add_option("--detector", ns_detector,
+        "Restrict the norm/shape truth bins to this detector (default: all detectors).");
+    normshape_command->add_option("--baseline", ns_baseline,
+        "If >= 0, evaluate the norm/shape oscillation probabilities at exactly this fixed "
+        "baseline (same units as L in the config's L/E variable, e.g. km) instead of each "
+        "event's own true L/E. Gives a detector-independent common coordinate definition.")
+        ->default_val(-1.0f);
+    normshape_command->add_option("--spectra", ns_spectra,
+        "Physics points (LINEAR units, nparams values per point, repeatable) whose CV and "
+        "oscillated truth spectra are written to <tag>_normshape_spectra.txt for example "
+        "plots. Combine with --nbins 1 --statonly to skip the grid scan.")->expected(-1);
 
     //PROfile, make N profile'd chi^2 for each physics and nuisence parameters
     CLI::App *profile_command = app.add_subcommand("profile", "Make a 1D profiled chi2 for each physics and nuisence parameter.");
@@ -614,6 +656,7 @@ int main(int argc, char* argv[])
 
     app.set_config("--config");
     surface_command->configurable(true);
+    normshape_command->configurable(true);
     process_command->configurable(true);
     profile_command->configurable(true);
     protest_command->configurable(true);
@@ -1829,6 +1872,79 @@ int main(int argc, char* argv[])
         //***********************************************************************
         //***********************************************************************
     }
+
+    //***********************************************************************
+    //**************** PROnormshape norm-shape scan *************************
+    //***********************************************************************
+    if(*normshape_command){
+        const size_t nphys = model->nparams;
+
+        // Broadcast a single --nbins value; otherwise require one entry per parameter.
+        std::vector<size_t> ns_nbins_vec;
+        if(ns_nbins.size() == 1) ns_nbins_vec.assign(nphys, (size_t)ns_nbins[0]);
+        else for(int n: ns_nbins) ns_nbins_vec.push_back((size_t)n);
+
+        // Default limits from the model bounds, converted to linear units for
+        // log10 parameters. Unbounded-below log10 parameters default to 1e-4.
+        if(ns_lo.empty()) {
+            for(size_t p = 0; p < nphys; ++p) {
+                float lb_int = std::isfinite(model->lb(p)) ? model->lb(p) : -4.0f;
+                ns_lo.push_back(model->is_log10[p] ? std::pow(10.0f, lb_int) : lb_int);
+            }
+        }
+        if(ns_hi.empty()) {
+            for(size_t p = 0; p < nphys; ++p) {
+                ns_hi.push_back(model->is_log10[p] ? std::pow(10.0f, model->ub(p)) : model->ub(p));
+            }
+        }
+
+        if(ns_truth_var < 0 || ns_truth_var >= (int)config.m_num_variables) {
+            log<LOG_ERROR>(L"%1% || --truth-var %2% out of range: config has %3% variables.")
+                % __func__ % ns_truth_var % config.m_num_variables;
+            return 1;
+        }
+
+        PROnormshape ns(*metric, config, prop, (size_t)ns_truth_var, ns_channel,
+                        ns_nbins_vec, ns_lo, ns_hi, ns_detector, ns_baseline);
+
+        // Example-spectra dump: CV and oscillated truth spectra for requested points.
+        if(ns_spectra.size()) {
+            if(ns_spectra.size() % nphys != 0) {
+                log<LOG_ERROR>(L"%1% || --spectra needs %2% values per point, got %3% values total.")
+                    % __func__ % nphys % ns_spectra.size();
+                return 1;
+            }
+            std::ofstream sf(final_output_tag + "_normshape_spectra.txt");
+            sf << "Parameters:";
+            for(const auto &name: model->param_names) sf << " " << name;
+            sf << "\nBaseline: " << ns_baseline << "\nEmin: " << ns.truth_e_min
+               << "\nEmax: " << ns.truth_e_max << "\nNBins: " << ns.P.size() << "\nCV:";
+            for(long b = 0; b < ns.P.size(); ++b) sf << " " << ns.P(b);
+            for(size_t k = 0; k < ns_spectra.size() / nphys; ++k) {
+                Eigen::VectorXf phys(nphys);
+                for(size_t p = 0; p < nphys; ++p) {
+                    float v = ns_spectra[k * nphys + p];
+                    phys(p) = model->is_log10[p] ? std::log10(v) : v;
+                }
+                normShapeOut nso;
+                ns.ComputeNormShape(nso, phys);
+                Eigen::VectorXf M = ns.TruthSpectrum(phys);
+                sf << "\nPoint:";
+                for(size_t p = 0; p < nphys; ++p) sf << " " << ns_spectra[k * nphys + p];
+                sf << " norm " << nso.norm << " shape " << nso.shape << "\nM:";
+                for(long b = 0; b < M.size(); ++b) sf << " " << M(b);
+            }
+            sf << "\n";
+            log<LOG_INFO>(L"%1% || Wrote %2% example spectra to %3%_normshape_spectra.txt")
+                % __func__ % (ns_spectra.size() / nphys) % final_output_tag.c_str();
+        }
+
+        if(progress_bar) scanFitConfig.progress_bar = true;
+        ns.Scan(scanFitConfig, myseed, nthread, statonly, CVParams);
+        ns.Write(final_output_tag + "_normshape.txt");
+        return 0;
+    }
+
     if(*proplot_command){
 
         log<LOG_INFO>(L"%1% || Making a PROsyst thats full covariance for future error bar creation (might be slow) ")% __func__ ;
