@@ -213,6 +213,18 @@ std::vector<normShapeOut> PROnormshape::Worker(const PROfitterConfig &fitconfig,
         output.point = grid[i];
         Eigen::VectorXf phys = Eigen::VectorXf::Map(grid[i].data(), nphys);
 
+        // Points violating the model constraint (e.g. unitarity) are recorded as
+        // NaN and never evaluated -- probability functions may be undefined there.
+        if(local_metric->GetModel().model_constraint &&
+           !local_metric->GetModel().model_constraint(phys)) {
+            output.chi2 = std::numeric_limits<float>::quiet_NaN();
+            output.norm = std::numeric_limits<float>::quiet_NaN();
+            output.shape = std::numeric_limits<float>::quiet_NaN();
+            outs.push_back(output);
+            if(progress) progress->increment_bar(0);
+            continue;
+        }
+
         if(statonly || nsplines == 0) {
             // All physics parameters pinned and nothing left to profile:
             // a single metric evaluation with nuisances at CV.
