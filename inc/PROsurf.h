@@ -32,6 +32,7 @@
 #include "TMarker.h"
 #include "TMultiGraph.h"
 #include "TArrow.h"
+#include "TDirectory.h"
 
 namespace PROfit {
 
@@ -158,6 +159,44 @@ namespace PROfit {
     };
 
     /**
+     * @brief How nuisance parameters are grouped into categories for the dominant-pull map.
+     */
+    enum class PullGrouping {
+        ByName, ///< One category per spline (and, optionally, per covariance-type systematic).
+        ByTag   ///< One category per XML `tag="..."` (first tag wins; untagged systematics keep their own name).
+    };
+
+    /**
+     * @brief Dominant (strongest-pulling) nuisance parameter at every point of a 2D surface.
+     * @details Modelled on Fig. 23 of the IceCube sterile search (Phys. Rev. D 102, 052009):
+     * at each physics grid point, the profiled best fit is inspected and the nuisance
+     * parameter with the largest pull is recorded. For a spline with a Gaussian prior the
+     * pull is (best fit - center) / prior sigma, i.e. exactly the square root of that
+     * parameter's contribution to the PROmetric::Pull penalty. Uniform-prior splines have
+     * no penalty and are excluded (listed in `skipped`). Covariance-type systematics have
+     * no fitted parameter; when requested, their pull is the analytic conditional posterior
+     * of the covariance modes at the best fit (same algebra as plotCovariancePosteriorPulls,
+     * Neyman statistical variances): with M = C_stat + Sigma_total and residual
+     * u = data - prediction, source k pays penalty u^T M^-1 Sigma_k M^-1 u, and its "pull" is
+     * the square root of that (which equals |alpha| for a single-mode source). The per-source
+     * penalties sum to the total covariance chi^2 contribution.
+     */
+    struct DominantPullMap {
+        std::vector<std::string> category_keys;    ///< Raw key per category: systematic name, or tag when grouped by tag.
+        std::vector<std::string> category_labels;  ///< Legend label per category (XML plotname, or the tag).
+        std::vector<bool> category_is_covar;       ///< True if every member of the category is a covariance-type systematic.
+        std::vector<int> counts;                   ///< Number of grid points won by each category.
+        Eigen::MatrixXi index;                     ///< (nbinsx x nbinsy) index of the winning category, -1 if no fit result / below threshold.
+        Eigen::MatrixXf pull;                      ///< (nbinsx x nbinsy) signed pull of the winning member (covariance sources: magnitude >= 0).
+        Eigen::MatrixXf chi2;                      ///< (nbinsx x nbinsy) copy of the profile Delta chi^2 surface, for contour overlays.
+        std::vector<std::string> skipped;          ///< Nuisance parameters excluded from the competition (uniform priors, zero prior width).
+        std::vector<std::string> member_names;     ///< Name of every competing nuisance parameter, in competition order.
+        std::vector<int> member_category;          ///< Category index of every competing nuisance parameter.
+        std::vector<Eigen::VectorXf> member_pulls; ///< Per grid point (row-major binx*nbinsy+biny) signed pull of every member; empty vector if no fit result.
+        float min_abs_pull = 0;                    ///< Threshold below which a grid point is left unassigned.
+    };
+
+    /**
      * @brief 2D chi-squared surface scanner for two-parameter exclusion contours.
      * @details Evaluates the profile chi-squared on a 2D grid of (x, y) physics parameter
      * values, minimising over all other parameters at each grid point via PROfitter.
@@ -241,6 +280,50 @@ namespace PROfit {
                              std::string filename,
                              bool logx, bool logy,
                              size_t xaxis_idx, size_t yaxis_idx);
+
+            /**
+             * @brief Populate `results`, `surface`, and the grid from a previously written `<tag>_surf.root`.
+             * @details Reads the TH2D "surf" (Delta chi^2, linear-space bin edges) and the TTree "tree"
+             * (xbin, ybin, chi2, best_fit map keyed by parameter name) written by the surface
+             * subcommand. Bin edges are converted back to the model's native space (log10 for
+             * is_log10 axes). Parameters missing from the stored map are set to their prior
+             * center (splines) or 0 (physics) with a warning. Lets the dominant-pull map be
+             * produced without re-running the (expensive) grid fits.
+             * @return false if the file, histogram, or tree could not be read.
+             */
+            bool LoadFromRootFile(const std::string &filename);
+
+            /**
+             * @brief Find the strongest-pulling nuisance parameter at every grid point (see DominantPullMap).
+             * @param config            Analysis configuration (plot names, tags, collapsing matrix).
+             * @param grouping          ByName (one category per systematic) or ByTag (group by XML tag).
+             * @param include_covar     Also compete the covariance-type systematics via their analytic
+             *                          posterior pulls; requires @p prop and @p data_collapsed.
+             * @param prop              MC event store (needed only when include_covar).
+             * @param data_collapsed    Collapsed data spectrum for config.i_prime (needed only when include_covar).
+             * @param min_abs_pull      Grid points whose largest |pull| is below this are left unassigned.
+             * @param nthreads          Threads for the per-point spectrum fills of the covariance pulls.
+             */
+            DominantPullMap ComputeDominantPulls(const PROconfig &config, PullGrouping grouping, bool include_covar = false, const PROpeller *prop = nullptr, const Eigen::VectorXf *data_collapsed = nullptr, float min_abs_pull = 0, int nthreads = 1) const;
+
+            /**
+             * @brief Draw the dominant-pull map: a categorical surface with a legend, Delta chi^2 contours overlaid,
+             * followed by a page with the magnitude of the largest pull.
+             * @param map            Output of ComputeDominantPulls.
+             * @param filename       Output PDF path (two pages).
+             * @param logx, logy     Axis scales.
+             * @param xlabel, ylabel Axis titles.
+             * @param contour_levels Delta chi^2 levels drawn in white, in order solid / dashed / dotted / dash-dotted.
+             * @param outdir         Optional ROOT directory to receive "dominant_pull_idx", "dominant_pull_value",
+             *                       "dominant_pull_max" (TH2D) and "dominant_pull_categories" (TNamed).
+             */
+            void PlotDominantPulls(const DominantPullMap &map, const std::string &filename, bool logx, bool logy, const std::string &xlabel, const std::string &ylabel, const std::vector<float> &contour_levels, TDirectory *outdir = nullptr) const;
+
+            /**
+             * @brief Write the dominant-pull map as text: one "xval yval dchi2 category pull" row per grid point,
+             * preceded by the category table and the per-member pull columns.
+             */
+            void WriteDominantPulls(const DominantPullMap &map, const std::string &filename) const;
 
             std::vector<surfOut> FillCurve(const PROfitterConfig &fitconfig, PROseed &proseed, float min_chi, const std::vector<Eigen::VectorXf> &seed_pts, int nThreads, std::vector<float> &A, std::vector<float> &B, size_t n_points);
             void PlotCurve(const PROconfig &config, const PROmodel &model, const PROsyst &syst, const std::vector<surfOut> & cpoints, std::string final_output_tag, bool logx, bool logy,size_t xaxis_idx,size_t yaxis_idx,std::vector<float> &A, std::vector<float> &B, size_t n_points);

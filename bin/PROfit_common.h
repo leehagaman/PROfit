@@ -182,6 +182,13 @@ struct PROpt {
     int n_brazil_throws = 1000;
     std::vector<std::string> brazil_throws;
     std::vector<float> procurve_points;
+    // Dominant-pull surface (strongest-pulling nuisance parameter per grid point, IceCube PRD 102 052009 Fig. 23 style).
+    bool pull_surface = false;
+    std::string pull_surface_group = "name";
+    bool pull_surface_covar = false;
+    float pull_surface_min = 0;
+    std::string pull_surface_from;
+    std::vector<float> pull_surface_levels = {4.61f, 5.99f, 9.21f};
 
     std::string reweights_file;
     std::vector<std::string> mockreweights;

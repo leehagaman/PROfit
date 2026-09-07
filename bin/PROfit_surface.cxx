@@ -1,5 +1,15 @@
 #include "PROfit_common.h"
 
+// Strongest-pulling nuisance parameter per grid point (--pull-surface). Shared by the
+// post-scan path and the --pull-surface-from re-plot path.
+static void make_dominant_pull_surface(PROsurf &surface, const PROconfig &config, const PROpeller &prop, const PROdata &data, const PROpt &options, const std::string &xlabel, const std::string &ylabel, TDirectory *outdir) {
+    const PullGrouping grouping = options.pull_surface_group == "tag" ? PullGrouping::ByTag : PullGrouping::ByName;
+    const Eigen::VectorXf data_spec = data.Spec();
+    DominantPullMap map = surface.ComputeDominantPulls(config, grouping, options.pull_surface_covar, &prop, &data_spec, options.pull_surface_min, (int)options.nthread);
+    surface.WriteDominantPulls(map, options.final_output_tag + "_dominant_pull_surface.txt");
+    surface.PlotDominantPulls(map, options.final_output_tag + "_dominant_pull_surface.pdf", options.logx, options.logy, xlabel, ylabel, options.pull_surface_levels, outdir);
+}
+
 void run_surface(float &global_fit_chi2, Eigen::VectorXf &global_fit_result, const PROconfig &config, const PROpeller &prop, PROmetric &metric, const PROdata &data, const Eigen::VectorXf &CVParams, const Eigen::VectorXf &fakeDataParams, const Eigen::VectorXf &lb, const Eigen::VectorXf &ub, const std::vector<int> &fixed, PROfitterConfig &fitConfig, PROfitterConfig &scanFitConfig, PROpt &options, PROseed &myseed) {
 
     std::uniform_int_distribution<uint32_t> dseed(0, std::numeric_limits<uint32_t>::max());
@@ -10,7 +20,7 @@ void run_surface(float &global_fit_chi2, Eigen::VectorXf &global_fit_result, con
     // chained invocation (global fit already run upstream) only the best-fit
     // point reaches run_surface, so fall back to that alone.
     std::vector<Eigen::VectorXf> surface_seeds;
-    if(global_fit_chi2 < 0) {
+    if(global_fit_chi2 < 0 && options.pull_surface_from.empty()) {
         GlobalFitOptions opt = GlobalFitOptions::Default;
         if(options.progress_bar) opt |= GlobalFitOptions::Progress;
         opt |= GlobalFitOptions::FreqSeedPts;
@@ -78,6 +88,27 @@ void run_surface(float &global_fit_chi2, Eigen::VectorXf &global_fit_result, con
     PROsurf surface(metric, xaxis_idx, yaxis_idx, nbinsx, options.logx ? PROsurf::LogAxis : PROsurf::LinAxis, options.xlo, options.xhi,
             nbinsy, options.logy ? PROsurf::LogAxis : PROsurf::LinAxis, options.ylo, options.yhi);
 
+    if(options.xlabel == "") 
+        options.xlabel = xaxis_idx < metric.GetModel().nparams ? metric.GetModel().pretty_param_names[xaxis_idx] : 
+            config.m_mcgen_variation_plotname_map.at(metric.GetSysts().spline_names[xaxis_idx]);
+    if(options.ylabel == "") 
+        options.ylabel = yaxis_idx < metric.GetModel().nparams ? metric.GetModel().pretty_param_names[yaxis_idx] : 
+            config.m_mcgen_variation_plotname_map.at(metric.GetSysts().spline_names[yaxis_idx]);
+
+    // --pull-surface-from: no fitting at all. Reload a finished surface (grid, Delta chi^2,
+    // per-point best fits) and only produce the dominant-pull map from it. Written to
+    // separate files so the input _surf.root is never clobbered.
+    if(!options.pull_surface_from.empty()) {
+        if(!surface.LoadFromRootFile(options.pull_surface_from)) {
+            log<LOG_ERROR>(L"%1% || Could not load a surface from %2%.") % __func__ % options.pull_surface_from.c_str();
+            exit(EXIT_FAILURE);
+        }
+        TFile fpull((options.final_output_tag+"_dominant_pull_surf.root").c_str(), "RECREATE");
+        make_dominant_pull_surface(surface, config, prop, data, options, options.xlabel, options.ylabel, &fpull);
+        fpull.Close();
+        return;
+    }
+
     if(options.procurve_points.size()!=0){
 
         size_t mid = options.procurve_points.size() / 2;
@@ -137,12 +168,6 @@ void run_surface(float &global_fit_chi2, Eigen::VectorXf &global_fit_result, con
     for(size_t i = 0; i < surface.nbinsy+1; i++)
         binedges_y.push_back(metric.GetModel().is_log10[yaxis_idx] ? std::pow(10, surface.edges_y(i)) : surface.edges_y(i));
 
-    if(options.xlabel == "") 
-        options.xlabel = xaxis_idx < metric.GetModel().nparams ? metric.GetModel().pretty_param_names[xaxis_idx] : 
-            config.m_mcgen_variation_plotname_map.at(metric.GetSysts().spline_names[xaxis_idx]);
-    if(options.ylabel == "") 
-        options.ylabel = yaxis_idx < metric.GetModel().nparams ? metric.GetModel().pretty_param_names[yaxis_idx] : 
-            config.m_mcgen_variation_plotname_map.at(metric.GetSysts().spline_names[yaxis_idx]);
     TH2D surf("surf", (";"+options.xlabel+";"+options.ylabel).c_str(), surface.nbinsx, binedges_x.data(), surface.nbinsy, binedges_y.data());
 
     for(size_t i = 0; i < surface.nbinsx; i++) {
@@ -192,6 +217,12 @@ void run_surface(float &global_fit_chi2, Eigen::VectorXf &global_fit_result, con
         surf.Draw("colz");
         drawVersionWatermark(&c);
         c.Print((options.final_output_tag+"_surface.pdf").c_str());
+
+        if(options.pull_surface && !options.statonly && !options.use_surface_amr) {
+            make_dominant_pull_surface(surface, config, prop, data, options, options.xlabel, options.ylabel, &fout);
+        } else if(options.pull_surface) {
+            log<LOG_WARNING>(L"%1% || --pull-surface needs the per-point best fits of a dense systematics surface; skipped for --statonly / --surface-amr.") % __func__;
+        }
     }
 
     std::vector<PROsurf> brazil_band_surfaces;

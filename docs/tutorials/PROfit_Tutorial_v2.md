@@ -1022,6 +1022,12 @@ Selected options (run `PROfit ... surface --help` for all):
   --amr-levels INT [3]    Refinement depth (resolution ≈ initial * 2^levels)
   --amr-delta FLOAT [0.5] Straddle-band widening in chi^2 units
   --amr-levels-chi2 ...   Target Delta-chi^2 contours (default 5.99)
+--pull-surface            Dominant-pull map: which nuisance parameter pulls hardest at each grid point
+  --pull-surface-group name|tag   One colour per systematic (default) or per XML tag="..."
+  --pull-surface-covar    Let covariance-type systematics compete (analytic posterior pull)
+  --pull-surface-min FLOAT [0]    Leave points with largest |pull| below this unassigned
+  --pull-surface-levels ... [4.61 5.99 9.21]  Delta-chi^2 contours overlaid on the map
+  --pull-surface-from FILE  Re-plot from an existing <tag>_surf.root, no fitting
 ```
 
 **For the `SBL_2flav_nueapp` model you must set the axes** — the built-in defaults are
@@ -1068,6 +1074,44 @@ still applies:
 PROfit -x tutorial.xml -t TUT -o surfstat --seed 405 -n 8 --statonly surface -g 30 $AXES
 PROfit -x tutorial.xml -t TUT -o surfnoflux --seed 405 -n 8 --exclude-systs Flux1 Flux2 Flux3 surface -g 30 $AXES
 ```
+
+### Dominant-pull map: `--pull-surface`
+
+Modelled on Fig. 23 of the IceCube sterile search (PRD 102, 052009): at each grid
+point the profiled best fit is inspected and the nuisance parameter with the
+largest pull, (best fit − prior centre)/prior σ, is recorded. The result is a
+categorical surface (one colour per systematic, legend ordered by how much of
+the plane each owns, only winners listed) with the Δχ² contours overlaid in
+white — solid/dashed/dotted for 90/95/99% CL by default — plus a second page
+with the magnitude of the largest pull. Inside the allowed region of an Asimov
+surface the pulls are ~0, so `--pull-surface-min 0.1` (or so) leaves those points
+blank instead of colouring noise; points whose largest pull is exactly 0 are
+always left blank.
+
+```bash
+PROfit -x cfg.xml -t tag -o v1 -n 16 surface -g 30 $AXES --pull-surface --pull-surface-group tag
+```
+
+writes `tag_v1_dominant_pull_surface.pdf` / `.txt` (per-point winner and every
+member's pull) and adds `dominant_pull_idx` / `dominant_pull_value` /
+`dominant_pull_max` TH2Ds and a `dominant_pull_categories` TNamed to `tag_v1_surf.root`.
+
+Uniform-prior splines have no pull term and are excluded. Covariance-type
+systematics have no fitted parameter; with `--pull-surface-covar` each one gets
+the square root of its share of the covariance χ² term at that best fit,
+`sqrt(uᵀ M⁻¹ Σ_k M⁻¹ u)` with `u = data − prediction`, `M = C_stat + Σ_total`
+(Neyman statistical variances) — identical to |α| for a single-mode source,
+and the shares sum to the full covariance term.
+
+The surface fits are the expensive part; the map itself is cheap, so it can be
+produced afterwards from any finished surface without refitting (same XML and axes):
+
+```bash
+PROfit -x cfg.xml -t tag -o replot surface -g 30 $AXES --pull-surface-from tag_v1_surf.root --pull-surface-covar --pull-surface-min 0.1
+```
+
+This writes `tag_replot_dominant_pull_surface.pdf/.txt` and
+`tag_replot_dominant_pull_surf.root`; the input file is left untouched.
 
 ### PROcurve: watching the pulls along a 1D path
 

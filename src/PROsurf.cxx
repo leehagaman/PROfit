@@ -5,6 +5,8 @@
 #include "PROmeshPlot.h"
 #include "PRObe.h"
 #include "PROwatermark.h"
+#include "PROcess.h"
+#include "PROtocall.h"
 
 #include <Eigen/Eigen>
 
@@ -16,6 +18,9 @@
 #include <functional>
 #include <fstream>
 #include <iomanip>
+#include <limits>
+#include <set>
+#include <sstream>
 
 #include "TGraph.h"
 #include "TLatex.h"
@@ -25,6 +30,13 @@
 #include "TH2D.h"
 #include "TH1F.h"
 #include "TBox.h"
+#include "TFile.h"
+#include "TTree.h"
+#include "TLegend.h"
+#include "TNamed.h"
+#include "TStyle.h"
+#include "TColor.h"
+#include "TCanvas.h"
 
 using namespace PROfit;
 
@@ -2145,4 +2157,422 @@ void PROfile::Plot(const PROconfig &config, const PROsyst &systs, const PROmodel
     delete c2;
 
     return;
+}
+
+
+// ---------------------------------------------------------------------------
+// Dominant-pull surface (strongest-pulling nuisance parameter per grid point)
+// ---------------------------------------------------------------------------
+
+bool PROsurf::LoadFromRootFile(const std::string &filename) {
+    TFile fin(filename.c_str(), "READ");
+    if(fin.IsZombie()) {
+        log<LOG_ERROR>(L"%1% || Could not open %2%.") % __func__ % filename.c_str();
+        return false;
+    }
+    TH2D *surf = fin.Get<TH2D>("surf");
+    TTree *tree = fin.Get<TTree>("tree");
+    if(!surf || !tree) {
+        log<LOG_ERROR>(L"%1% || %2% does not contain both a TH2D \"surf\" and a TTree \"tree\" (surface subcommand output expected).") % __func__ % filename.c_str();
+        return false;
+    }
+
+    const PROmodel &model = metric.GetModel();
+    const PROsyst &systs = metric.GetSysts();
+    const size_t nphys = model.nparams, nspl = systs.GetNSplines();
+
+    // Grid: the histogram carries linear-space edges; PROsurf stores the model's
+    // native space (log10 for is_log10 axes), matching the constructor.
+    nbinsx = surf->GetNbinsX();
+    nbinsy = surf->GetNbinsY();
+    edges_x = Eigen::VectorXf(nbinsx + 1);
+    edges_y = Eigen::VectorXf(nbinsy + 1);
+    const bool xlog = x_idx < nphys && model.is_log10[x_idx];
+    const bool ylog = y_idx < nphys && model.is_log10[y_idx];
+    for(size_t i = 0; i <= nbinsx; ++i) {
+        float e = surf->GetXaxis()->GetBinLowEdge(i + 1);
+        edges_x(i) = xlog ? std::log10(e) : e;
+    }
+    for(size_t j = 0; j <= nbinsy; ++j) {
+        float e = surf->GetYaxis()->GetBinLowEdge(j + 1);
+        edges_y(j) = ylog ? std::log10(e) : e;
+    }
+    surface = Eigen::MatrixXf::Constant(nbinsx, nbinsy, std::numeric_limits<float>::quiet_NaN());
+    for(size_t i = 0; i < nbinsx; ++i)
+        for(size_t j = 0; j < nbinsy; ++j)
+            surface(i, j) = surf->GetBinContent(i + 1, j + 1);
+
+    float chi2; int xbin, ybin;
+    std::map<std::string, float> *best_fit = nullptr;
+    tree->SetBranchAddress("chi2", &chi2);
+    tree->SetBranchAddress("xbin", &xbin);
+    tree->SetBranchAddress("ybin", &ybin);
+    tree->SetBranchAddress("best_fit", &best_fit);
+
+    results.clear();
+    std::set<std::string> missing;
+    for(Long64_t n = 0; n < tree->GetEntries(); ++n) {
+        tree->GetEntry(n);
+        SurfPointResult r;
+        r.binx = xbin; r.biny = ybin; r.chi2 = chi2;
+        if(best_fit && !best_fit->empty()) {
+            r.best_fit = Eigen::VectorXf(nphys + nspl);
+            for(size_t i = 0; i < nphys; ++i) {
+                auto it = best_fit->find(model.param_names[i]);
+                if(it == best_fit->end()) { missing.insert(model.param_names[i]); r.best_fit(i) = 0; }
+                else r.best_fit(i) = it->second;
+            }
+            for(size_t i = 0; i < nspl; ++i) {
+                auto it = best_fit->find(systs.spline_names[i]);
+                if(it == best_fit->end()) { missing.insert(systs.spline_names[i]); r.best_fit(nphys + i) = systs.spline_centers(i); }
+                else r.best_fit(nphys + i) = it->second;
+            }
+        }
+        results.push_back(std::move(r));
+    }
+    for(const std::string &m: missing)
+        log<LOG_WARNING>(L"%1% || Parameter %2% not found in the stored best-fit map of %3%; using its default (physics: 0, spline: prior center). Was the surface made with a different XML?") % __func__ % m.c_str() % filename.c_str();
+    log<LOG_INFO>(L"%1% || Loaded %2% grid points (%3% x %4%) from %5%.") % __func__ % results.size() % nbinsx % nbinsy % filename.c_str();
+    return !results.empty();
+}
+
+DominantPullMap PROsurf::ComputeDominantPulls(const PROconfig &config, PullGrouping grouping, bool include_covar, const PROpeller *prop, const Eigen::VectorXf *data_collapsed, float min_abs_pull, int nthreads) const {
+    const PROmodel &model = metric.GetModel();
+    const PROsyst &systs = metric.GetSysts();
+    const size_t nphys = model.nparams, nspl = systs.GetNSplines(), ncov = systs.GetNCovar();
+
+    DominantPullMap map;
+    map.min_abs_pull = min_abs_pull;
+    map.index = Eigen::MatrixXi::Constant(nbinsx, nbinsy, -1);
+    map.pull  = Eigen::MatrixXf::Zero(nbinsx, nbinsy);
+    map.chi2  = surface;
+
+    if(include_covar && ncov > 0 && (!prop || !data_collapsed)) {
+        log<LOG_WARNING>(L"%1% || Covariance-type pulls requested but no MC store / data spectrum supplied; competing splines only.") % __func__;
+        include_covar = false;
+    }
+    if(include_covar && ncov == 0) include_covar = false;
+
+    // --- Category bookkeeping -------------------------------------------------
+    auto category_of = [&](const std::string &name, bool is_covar) -> int {
+        std::string key = name, label;
+        auto pn = config.m_mcgen_variation_plotname_map.find(name);
+        label = pn != config.m_mcgen_variation_plotname_map.end() ? pn->second : name;
+        if(grouping == PullGrouping::ByTag) {
+            auto tg = config.m_mcgen_variation_tags.find(name);
+            if(tg != config.m_mcgen_variation_tags.end() && !tg->second.empty()) {
+                key = "tag:" + tg->second.front();
+                label = tg->second.front();
+            }
+        }
+        for(size_t c = 0; c < map.category_keys.size(); ++c) {
+            if(map.category_keys[c] == key) {
+                if(!is_covar) map.category_is_covar[c] = false;
+                return (int)c;
+            }
+        }
+        map.category_keys.push_back(key);
+        map.category_labels.push_back(label);
+        map.category_is_covar.push_back(is_covar);
+        return (int)map.category_keys.size() - 1;
+    };
+
+    // Competing splines: Gaussian prior with a positive width.
+    std::vector<int> spline_members;      // spline index
+    for(size_t i = 0; i < nspl; ++i) {
+        const bool uniform = i < systs.spline_prior_types.size() && systs.spline_prior_types[i] == SplinePriorType::Uniform;
+        const float sigma = i < (size_t)systs.spline_priors.size() ? systs.spline_priors(i) : 1.0f;
+        if(uniform || !(sigma > 0)) {
+            map.skipped.push_back(systs.spline_names[i]);
+            continue;
+        }
+        spline_members.push_back((int)i);
+        map.member_names.push_back(systs.spline_names[i]);
+        map.member_category.push_back(category_of(systs.spline_names[i], false));
+    }
+    const size_t n_spline_members = spline_members.size();
+    if(include_covar) {
+        for(size_t k = 0; k < ncov; ++k) {
+            map.member_names.push_back(systs.covar_names[k]);
+            map.member_category.push_back(category_of(systs.covar_names[k], true));
+        }
+    }
+    map.counts.assign(map.category_keys.size(), 0);
+    if(!map.skipped.empty())
+        log<LOG_WARNING>(L"%1% || %2% spline(s) with a uniform / undefined prior have no pull and are excluded from the dominant-pull competition (first: %3%).") % __func__ % map.skipped.size() % map.skipped.front().c_str();
+    if(map.member_names.empty()) {
+        log<LOG_WARNING>(L"%1% || No nuisance parameter with a defined pull; the dominant-pull map is empty.") % __func__;
+        return map;
+    }
+
+    // --- Per-point spline pulls --------------------------------------------------
+    const size_t npts = nbinsx * nbinsy;
+    map.member_pulls.assign(npts, Eigen::VectorXf());
+    std::vector<const SurfPointResult*> at(npts, nullptr);
+    for(const auto &r: results) {
+        if(r.binx < 0 || r.biny < 0 || (size_t)r.binx >= nbinsx || (size_t)r.biny >= nbinsy) continue;
+        at[(size_t)r.binx * nbinsy + r.biny] = &r;
+    }
+    for(size_t p = 0; p < npts; ++p) {
+        const SurfPointResult *r = at[p];
+        if(!r || (size_t)r->best_fit.size() < nphys + nspl) continue;
+        Eigen::VectorXf pulls = Eigen::VectorXf::Zero(map.member_names.size());
+        for(size_t m = 0; m < n_spline_members; ++m) {
+            const int i = spline_members[m];
+            pulls(m) = (r->best_fit(nphys + i) - systs.spline_centers(i)) / systs.spline_priors(i);
+        }
+        map.member_pulls[p] = std::move(pulls);
+    }
+
+    // --- Per-point covariance-source pulls (analytic posterior at the best fit) ---
+    if(include_covar) {
+        // penalty_k = u^T M^-1 Sigma_k M^-1 u with Sigma_k = S^T F_k S, S = diag(spec) T:
+        // with w = M^-1 u (on the active collapsed bins) and v = spec .* (T w), the
+        // penalty is v^T F_k v -- one dense N x N mat-vec per source, no per-source
+        // collapse. Sum over k of penalty_k = the total covariance chi^2 term.
+        std::vector<Eigen::MatrixXf> Fk;
+        Fk.reserve(ncov);
+        for(size_t k = 0; k < ncov; ++k) Fk.push_back(systs.GrabMatrix(systs.covar_names[k]));
+        const Eigen::SparseMatrix<float> &T = config.GetCollapsingMatrixSparse();
+        const int var_index = config.i_prime;
+        const Eigen::VectorXf &data = *data_collapsed;
+        std::vector<Eigen::Index> active;
+        for(Eigen::Index i = 0; i < data.size(); ++i)
+            if(config.IsBinActive(var_index, i) && data(i) > 0) active.push_back(i);
+        if(active.empty() || (Eigen::Index)config.m_num_variable_bins_total_collapsed[var_index] != data.size()) {
+            log<LOG_WARNING>(L"%1% || Data spectrum has %2% bins (expected %3%) or no active bins; skipping covariance-type pulls.") % __func__ % data.size() % config.m_num_variable_bins_total_collapsed[var_index];
+        } else {
+            const Eigen::Map<const Eigen::Matrix<Eigen::Index, Eigen::Dynamic, 1>> idx(active.data(), (Eigen::Index)active.size());
+            Eigen::VectorXf stat_var(active.size());
+            for(size_t a = 0; a < active.size(); ++a) stat_var(a) = std::max(data(active[a]), 1.0f);
+
+            std::atomic<size_t> counter{0};
+            auto worker = [&]() {
+                while(true) {
+                    const size_t p = counter.fetch_add(1);
+                    if(p >= npts) break;
+                    const SurfPointResult *r = at[p];
+                    if(!r || map.member_pulls[p].size() == 0) continue;
+                    Eigen::VectorXf spec = FillSpectra(config, *prop, systs, model, r->best_fit, true, var_index).Spec();
+                    for(Eigen::Index i = 0; i < spec.size(); ++i) if(spec(i) <= 0.0f) spec(i) = 1e-6f;
+                    Eigen::VectorXf coll = CollapseMatrix(config, spec, var_index);
+                    Eigen::MatrixXf M = CollapsedScaledCovariance(config, systs.fractional_covariance, spec)(idx, idx);
+                    M += Eigen::MatrixXf(stat_var.asDiagonal());
+                    Eigen::VectorXf u = data(idx) - coll(idx);
+                    Eigen::VectorXf w = M.llt().solve(u);
+                    Eigen::VectorXf w_full = Eigen::VectorXf::Zero(data.size());
+                    for(size_t a = 0; a < active.size(); ++a) w_full(active[a]) = w(a);
+                    Eigen::VectorXf v = spec.cwiseProduct(T * w_full);
+                    Eigen::VectorXf &pulls = map.member_pulls[p];
+                    for(size_t k = 0; k < ncov; ++k)
+                        pulls(n_spline_members + k) = std::sqrt(std::max(0.0f, v.dot(Fk[k] * v)));
+                }
+            };
+            std::vector<std::future<void>> futs;
+            for(int t = 0; t < std::max(1, nthreads); ++t) futs.emplace_back(std::async(std::launch::async, worker));
+            for(auto &f: futs) f.get();
+        }
+    }
+
+    // --- Winner per point ---------------------------------------------------------
+    size_t assigned = 0;
+    for(size_t p = 0; p < npts; ++p) {
+        const Eigen::VectorXf &pulls = map.member_pulls[p];
+        if(pulls.size() == 0) continue;
+        Eigen::Index best = 0;
+        pulls.cwiseAbs().maxCoeff(&best);
+        const float val = pulls(best);
+        const size_t i = p / nbinsy, j = p % nbinsy;
+        // A largest pull of exactly zero (Asimov fit sitting on the CV) has no dominant
+        // parameter -- argmax would just return the first member -- so leave it unassigned.
+        if(val == 0.0f || std::abs(val) < min_abs_pull) continue;
+        map.index((Eigen::Index)i, (Eigen::Index)j) = map.member_category[best];
+        map.pull((Eigen::Index)i, (Eigen::Index)j) = val;
+        ++map.counts[map.member_category[best]];
+        ++assigned;
+    }
+    log<LOG_INFO>(L"%1% || Dominant pull assigned at %2% of %3% grid points over %4% categories (%5% competing nuisance parameters%6%).")
+        % __func__ % assigned % npts % map.category_keys.size() % map.member_names.size() % (include_covar ? ", incl. covariance sources" : "");
+    for(size_t c = 0; c < map.category_keys.size(); ++c)
+        if(map.counts[c] > 0)
+            log<LOG_INFO>(L"%1% ||   %2% grid points: %3%") % __func__ % map.counts[c] % map.category_labels[c].c_str();
+    return map;
+}
+
+void PROsurf::WriteDominantPulls(const DominantPullMap &map, const std::string &filename) const {
+    std::ofstream out(filename);
+    if(!out) {
+        log<LOG_ERROR>(L"%1% || Could not open %2% for writing.") % __func__ % filename.c_str();
+        return;
+    }
+    out << "Dimensions: " << nbinsx << " " << nbinsy << "\n";
+    out << "Fixed indices: " << x_idx << " " << y_idx << "\n";
+    out << "MinAbsPull: " << map.min_abs_pull << "\n";
+    out << "Categories (index count key label):\n";
+    for(size_t c = 0; c < map.category_keys.size(); ++c)
+        out << c << " " << map.counts[c] << " " << map.category_keys[c] << " \"" << map.category_labels[c] << "\"\n";
+    out << "Skipped (no defined pull):";
+    for(const auto &s: map.skipped) out << " " << s;
+    out << "\nMembers (column order of the per-member pulls; -> category index):\n";
+    for(size_t m = 0; m < map.member_names.size(); ++m)
+        out << map.member_names[m] << " -> " << map.member_category[m] << "\n";
+    out << "\nxval yval dchi2 category pull";
+    for(size_t m = 0; m < map.member_names.size(); ++m) out << " m" << m;
+    // Grid values in the model's native space, as the surface .txt does.
+    for(size_t i = 0; i < nbinsx; ++i) {
+        for(size_t j = 0; j < nbinsy; ++j) {
+            out << "\n" << edges_x(i) << " " << edges_y(j) << " " << map.chi2(i, j) << " " << map.index(i, j) << " " << map.pull(i, j);
+            const Eigen::VectorXf &pulls = map.member_pulls[i * nbinsy + j];
+            for(Eigen::Index m = 0; m < pulls.size(); ++m) out << " " << pulls(m);
+        }
+    }
+    out << "\n";
+}
+
+void PROsurf::PlotDominantPulls(const DominantPullMap &map, const std::string &filename, bool logx, bool logy, const std::string &xlabel, const std::string &ylabel, const std::vector<float> &contour_levels, TDirectory *outdir) const {
+    const PROmodel &model = metric.GetModel();
+    const size_t nphys = model.nparams;
+    std::vector<double> bx(nbinsx + 1), by(nbinsy + 1);
+    const bool xlog10 = x_idx < nphys && model.is_log10[x_idx];
+    const bool ylog10 = y_idx < nphys && model.is_log10[y_idx];
+    for(size_t i = 0; i <= nbinsx; ++i) bx[i] = xlog10 ? std::pow(10.0, edges_x(i)) : edges_x(i);
+    for(size_t j = 0; j <= nbinsy; ++j) by[j] = ylog10 ? std::pow(10.0, edges_y(j)) : edges_y(j);
+
+    // Only categories that win somewhere get a colour / legend entry, ordered by
+    // how much of the surface they own.
+    std::vector<int> winners;
+    for(size_t c = 0; c < map.category_keys.size(); ++c) if(map.counts[c] > 0) winners.push_back((int)c);
+    std::sort(winners.begin(), winners.end(), [&](int a, int b){ return map.counts[a] > map.counts[b]; });
+    std::vector<int> rank(map.category_keys.size(), -1);
+    for(size_t w = 0; w < winners.size(); ++w) rank[winners[w]] = (int)w;
+
+    // Qualitative palette (Tableau 20 + extras); wraps with a lighter tint if exceeded.
+    static const char *hex[] = {"#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf",
+                                "#aec7e8","#ffbb78","#98df8a","#ff9896","#c5b0d5","#c49c94","#f7b6d2","#c7c7c7","#dbdb8d","#9edae5",
+                                "#393b79","#637939","#8c6d31","#843c39","#7b4173","#5254a3","#8ca252","#bd9e39","#ad494a","#a55194"};
+    const int nhex = sizeof(hex) / sizeof(hex[0]);
+    std::vector<int> colors;
+    for(size_t w = 0; w < winners.size(); ++w) colors.push_back(TColor::GetColor(hex[w % nhex]));
+
+    TH2D hidx("dominant_pull_idx", ("Dominant nuisance parameter;" + xlabel + ";" + ylabel).c_str(), nbinsx, bx.data(), nbinsy, by.data());
+    TH2D hval("dominant_pull_value", ("Signed pull of the dominant nuisance parameter;" + xlabel + ";" + ylabel).c_str(), nbinsx, bx.data(), nbinsy, by.data());
+    TH2D hmax("dominant_pull_max", ("Largest |pull|;" + xlabel + ";" + ylabel).c_str(), nbinsx, bx.data(), nbinsy, by.data());
+    TH2D hrank("dominant_pull_rank", "", nbinsx, bx.data(), nbinsy, by.data());
+    TH2D hchi("dominant_pull_chi2", "", nbinsx, bx.data(), nbinsy, by.data());
+    // Stack-owned: keep them out of any open TFile's directory (Write() below is explicit).
+    for(TH2D *h: {&hidx, &hval, &hmax, &hrank, &hchi}) h->SetDirectory(nullptr);
+    for(size_t i = 0; i < nbinsx; ++i) {
+        for(size_t j = 0; j < nbinsy; ++j) {
+            const int c = map.index(i, j);
+            hchi.SetBinContent(i + 1, j + 1, std::isfinite(map.chi2(i, j)) ? map.chi2(i, j) : 1e9);
+            if(c < 0) continue;
+            hidx.SetBinContent(i + 1, j + 1, c + 1);       // 0 = unassigned (drawn empty)
+            hrank.SetBinContent(i + 1, j + 1, rank[c] + 1);
+            hval.SetBinContent(i + 1, j + 1, map.pull(i, j));
+            hmax.SetBinContent(i + 1, j + 1, std::abs(map.pull(i, j)));
+        }
+    }
+
+    TCanvas c("c_dominant_pull", "Dominant pull", 1100, 800);
+    c.SetLeftMargin(0.11); c.SetRightMargin(0.36); c.SetBottomMargin(0.11); c.SetTopMargin(0.08);
+    if(logx) c.SetLogx();
+    if(logy) c.SetLogy();
+    c.Print((filename + "[").c_str());
+
+    auto draw_contours = [&](std::vector<std::unique_ptr<TH2D>> &keep) {
+        const int styles[] = {1, 2, 3, 4, 5, 6};
+        for(size_t l = 0; l < contour_levels.size(); ++l) {
+            keep.emplace_back(static_cast<TH2D*>(hchi.Clone(("chi_cont_" + std::to_string(l)).c_str())));
+            TH2D *h = keep.back().get();
+            h->SetDirectory(nullptr);
+            double lev = contour_levels[l];
+            h->SetContour(1, &lev);
+            h->SetLineColor(kWhite);
+            h->SetLineWidth(4);
+            h->SetLineStyle(styles[l % 6]);
+            h->Draw("CONT3 SAME");
+        }
+    };
+    auto contour_legend = [&](TLegend *leg, std::vector<std::unique_ptr<TH2D>> &keep) {
+        static const std::map<int, std::string> cl_names = {{230, "68% CL"}, {461, "90% CL"}, {599, "95% CL"}, {921, "99% CL"}, {1183, "3#sigma"}};
+        for(size_t l = 0; l < contour_levels.size() && l < keep.size(); ++l) {
+            auto it = cl_names.find((int)std::lround(contour_levels[l] * 100));
+            std::string txt = it != cl_names.end() ? it->second + " (#Delta#chi^{2} = " : "#Delta#chi^{2} = ";
+            std::ostringstream os; os << std::setprecision(3) << contour_levels[l];
+            txt += os.str(); if(it != cl_names.end()) txt += ")";
+            keep[l]->SetLineColor(kBlack); // legend swatch on a white background
+            leg->AddEntry(keep[l].get(), txt.c_str(), "l");
+        }
+    };
+
+    // ---- Page 1: categorical map + legend + contours ----
+    {
+        if(!winners.empty()) gStyle->SetPalette((int)colors.size(), colors.data());
+        hrank.SetStats(0);
+        std::string title = "Dominant nuisance parameter";
+        if(map.min_abs_pull > 0) { std::ostringstream o; o << " (|pull| #geq " << map.min_abs_pull << ")"; title += o.str(); }
+        hrank.SetTitle((title + ";" + xlabel + ";" + ylabel).c_str());
+        hrank.SetMinimum(0.5);
+        hrank.SetMaximum(std::max<double>(1.5, winners.size() + 0.5));
+        hrank.GetXaxis()->SetTitleOffset(1.2);
+        hrank.GetYaxis()->SetTitleOffset(1.3);
+        hrank.Draw("COL");
+        std::vector<std::unique_ptr<TH2D>> keep;
+        draw_contours(keep);
+
+        const size_t nentries = winners.size() + contour_levels.size();
+        const double y_hi = 0.92, y_lo = std::max(0.08, y_hi - 0.035 * std::max<size_t>(nentries, 1));
+        TLegend leg(0.655, y_lo, 0.995, y_hi);
+        leg.SetBorderSize(0); leg.SetFillStyle(0);
+        leg.SetTextSize(nentries > 20 ? 0.02 : 0.026);
+        std::vector<std::unique_ptr<TBox>> swatches;
+        for(size_t w = 0; w < winners.size(); ++w) {
+            swatches.emplace_back(new TBox(0, 0, 1, 1));
+            swatches.back()->SetFillColor(colors[w]);
+            swatches.back()->SetLineColor(colors[w]);
+            std::string lab = map.category_labels[winners[w]] + " (" + std::to_string(map.counts[winners[w]]) + ")";
+            leg.AddEntry(swatches.back().get(), lab.c_str(), "f");
+        }
+        // Copies for the legend swatches of the contours must not recolour the drawn white lines.
+        std::vector<std::unique_ptr<TH2D>> legend_copies;
+        for(size_t l = 0; l < keep.size(); ++l) {
+            legend_copies.emplace_back(static_cast<TH2D*>(keep[l]->Clone()));
+            legend_copies.back()->SetDirectory(nullptr);
+        }
+        contour_legend(&leg, legend_copies);
+        leg.Draw();
+        drawVersionWatermark(&c);
+        c.Print(filename.c_str());
+        gStyle->SetPalette(kViridis);
+    }
+
+    // ---- Page 2: magnitude of the largest pull ----
+    {
+        c.Clear();
+        c.SetRightMargin(0.16);
+        if(logx) c.SetLogx();
+        if(logy) c.SetLogy();
+        gStyle->SetPalette(kViridis);
+        hmax.SetStats(0);
+        hmax.GetZaxis()->SetTitle("largest |pull| [prior #sigma]");
+        hmax.GetZaxis()->SetTitleOffset(1.1);
+        hmax.Draw("COLZ");
+        std::vector<std::unique_ptr<TH2D>> keep;
+        draw_contours(keep);
+        drawVersionWatermark(&c);
+        c.Print(filename.c_str());
+    }
+    c.Print((filename + "]").c_str());
+
+    if(outdir) {
+        outdir->cd();
+        hidx.Write();
+        hval.Write();
+        hmax.Write();
+        std::string cats;
+        for(size_t k = 0; k < map.category_keys.size(); ++k)
+            cats += (k ? ";" : "") + std::to_string(k + 1) + ":" + map.category_labels[k] + "[" + map.category_keys[k] + "]";
+        TNamed("dominant_pull_categories", cats.c_str()).Write();
+    }
+    log<LOG_INFO>(L"%1% || Wrote %2%") % __func__ % filename.c_str();
 }
